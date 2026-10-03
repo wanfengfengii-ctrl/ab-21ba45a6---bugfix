@@ -1,0 +1,30 @@
+services:
+  app:
+    build:
+      context: .
+      target: runtime
+    environment:
+      APP_PORT: 3000
+    ports:
+      # Host-side port is controlled by APP_PORT (defaults to 3000).
+      - "${APP_PORT:-3000}:3000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 4s
+    restart: unless-stopped
+
+  # One-shot service: runs unit tests, TypeScript build, then live API checks
+  # against the healthy app container, and exits with an aggregated code.
+  verify:
+    build:
+      context: .
+      target: verify
+    depends_on:
+      app:
+        condition: service_healthy
+    environment:
+      APP_BASE_URL: http://app:3000
+    restart: "no"
