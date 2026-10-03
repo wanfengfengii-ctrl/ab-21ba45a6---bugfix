@@ -108,6 +108,27 @@ APP_PORT=3000 npm start
 }
 ```
 
+只有在**已证明**约束无解时才返回 `422 status=infeasible`。若精确搜索在给出
+无解方程之前耗尽节点/时间预算,接口**不会**把它当作无解:此时返回
+
+`503`:
+
+```json
+{
+  "status": "undetermined",
+  "message": "the solver exhausted its search budget before feasibility could be proven or disproven; this does NOT mean no feasible assignment exists",
+  "conflict": {
+    "reason": "...",
+    "searchLimitReached": true,
+    "resourceLimits": { "nodeLimit": 3000000, "timeLimitMs": 8000 }
+  }
+}
+```
+
+`undetermined` 表示"尚未裁决",不是"无可行分池";调用方不得据此拒绝面板。
+边界规模(18 项、4 池、稠密风险图)由组合式风险下界在预算内精确完成,
+正常返回 `200`,不会落到 `503`。
+
 ## 一次性 verify 服务
 
 `verify` 是一次性容器:等待 `app` 健康后,依次执行并**自行退出**,
@@ -118,7 +139,7 @@ APP_PORT=3000 npm start
 | 1 | 单元测试(`npm test`,含对暴力枚举参照实现的逐案最优性比对) |
 | 2 | TypeScript 构建(`npm run build`) |
 | 4 | 等待应用 `/health` 健康 |
-| 8 | 线上 API 核对(含**非贪心陷阱**、不可行 422、非法输入 400、稳定性复测) |
+| 8 | 线上 API 核对(含**非贪心陷阱**、18 项稠密风险边界、不可行 422、非法输入 400、稳定性复测);预算未决 503 语义由单元测试覆盖 |
 
 ```bash
 docker compose up --build --abort-on-container-exit --exit-code-from verify verify

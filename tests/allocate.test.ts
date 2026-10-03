@@ -130,8 +130,7 @@ test('solver matches brute-force optimum on random 8-amplicon instances', () => 
   let feasibleCases = 0;
   for (let trial = 0; trial < 120; trial++) {
     const k = 2 + Math.floor(rand() * 2); // 2 or 3 pools
-    const n = 8;
-    const amplicons = Array.from({ length: n }, (_, i) => ({
+    const n = 8;    const amplicons = Array.from({ length: n }, (_, i) => ({
       id: `A${i}`,
       load: 1 + Math.floor(rand() * 6),
       control: false,
@@ -377,4 +376,183 @@ test('HTTP layer: 400 with field errors, 422 on infeasible, 200 on success', asy
     })),
   );
   assert.equal(ok.status, 200);
+});
+
+// ------------------------------------------------- 18-amplicon density boundary
+
+// The maximal panel: 18 amplicons into 4 pools, loads all 1 in [4,5], the
+// first 4 are controls and every non-control pair has risk 1 below the
+// forbidden threshold of 2 (so there are no hard-forbidden pairs). A dense
+// exact search without tight risk bounds blows its node budget exploring ~25
+// million equally-optimal leaves and (wrongly) reported infeasible.
+function denseBoundaryRequest(): AllocateRequest {
+  const amplicons = Array.from({ length: 18 }, (_, i) => ({
+    id: `A${i}`,
+    load: 1,
+    control: i < 4,
+  }));
+  const risks = [];
+  for (let i = 4; i < 18; i++)
+    for (let j = i + 1; j < 18; j++)
+      risks.push({ a: `A${i}`, b: `A${j}`, risk: 1 });
+  return {
+    amplicons,
+    poolCount: 4,
+    loadRange: { min: 4, max: 5 },
+    risks,
+    forbiddenThreshold: 2,
+  };
+}
+
+test('dense 18-amplicon panel is feasible with the proven optimal objectives and stable pool sequence', () => {
+  const req = denseBoundaryRequest();
+  const data = expectFeasible(req);
+  assertHardConstraints(req, data);
+  assert.equal(data.maxPoolRisk, 6);
+  assert.equal(data.totalRisk, 18);
+  assert.equal(data.loadRangeSpread, 1);
+  assert.deepEqual(
+    data.assignment.map(a => a.pool),
+    [1, 2, 3, 4, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 4, 4, 4],
+  );
+  // The four controls anchor the four pools, one each.
+  for (const pool of data.pools) assert.equal(pool.controls.length, 1);
+  // Determinism / stability.
+  const again = expectFeasible(req);
+  assert.deepEqual(again.assignment, data.assignment);
+});
+
+test('new risk bounds match brute force on dense complete-risk panels', () => {
+  // Dense (all non-control pairs soft, risk 1) instances stress exactly the
+  // relaxation added for the boundary case. Checked exhaustively.
+  for (const n of [8, 9, 10]) {
+    for (const k of [2, 3, 4]) {
+      const amplicons = Array.from({ length: n }, (_, i) => ({
+        id: `A${i}`,
+        load: 1,
+        control: i < k,
+      }));
+      const risks = [];
+      for (let i = k; i < n; i++)
+        for (let j = i + 1; j < n; j++)
+          risks.push({ a: `A${i}`, b: `A${j}`, risk: 1 });
+      const req: AllocateRequest = {
+        amplicons,
+        poolCount: k,
+        loadRange: { min: Math.floor(n / k), max: n },
+        risks,
+        forbiddenThreshold: 2,
+      };
+      const ref = bruteForceBest(req);
+      const result = allocate(req);
+      assert.equal(result.feasible, true, `n=${n} k=${k}: should be feasible`);
+      if (result.feasible && ref) {
+        assert.equal(result.data.maxPoolRisk, ref.maxRisk, `n=${n} k=${k}: maxPoolRisk`);
+        assert.equal(result.data.totalRisk, ref.totalRisk, `n=${n} k=${k}: totalRisk`);
+        assert.equal(result.data.loadRangeSpread, ref.spread, `n=${n} k=${k}: spread`);
+        assert.deepEqual(
+          result.data.assignment.map(a => a.pool - 1),
+          ref.seq,
+          `n=${n} k=${k}: stable sequence`,
+        );
+      }
+    }
+  }
+});
+
+test('mixed-weight soft risks also match brute force on dense panels', () => {
+  const rand = mulberry32(777);
+  for (let trial = 0; trial < 30; trial++) {
+    const n = 8 + Math.floor(rand() * 3); // 8..10
+    const k = 2 + Math.floor(rand() * 3); // 2..4
+    const amplicons = Array.from({ length: n }, (_, i) => ({
+      id: `A${i}`,
+      load: 1 + Math.floor(rand() * 3),
+      control: i < k,
+    }));
+    const risks = [];
+    for (let i = 0; i < n; i++)
+      for (let j = i + 1; j < n; j++)
+        if (rand() < 0.8) risks.push({ a: `A${i}`, b: `A${j}`, risk: 1 + Math.floor(rand() * 5) });
+    const req: AllocateRequest = {
+      amplicons,
+      poolCount: k,
+      loadRange: { min: 4, max: 30 },
+      risks,
+      forbiddenThreshold: 10,
+    };
+    const ref = bruteForceBest(req);
+    const result = allocate(req);
+    if (!ref) {
+      assert.equal(result.feasible, false, `trial ${trial}: ref infeasible`);
+      continue;
+    }
+    assert.equal(result.feasible, true, `trial ${trial}: solver missed feasible dense case`);
+    if (result.feasible) {
+      assert.equal(result.data.maxPoolRisk, ref.maxRisk, `trial ${trial}: maxPoolRisk`);
+      assert.equal(result.data.totalRisk, ref.totalRisk, `trial ${trial}: totalRisk`);
+      assert.equal(result.data.loadRangeSpread, ref.spread, `trial ${trial}: spread`);
+      assert.deepEqual(
+        result.data.assignment.map(a => a.pool - 1),
+        ref.seq,
+        `trial ${trial}: sequence`,
+      );
+    }
+  }
+});
+
+// ------------------------------------------------- undetermined vs proven infeasible
+
+test('a search budget cutoff is reported as undetermined, never as infeasible', () => {
+  const req = denseBoundaryRequest();
+  const res = allocate(req, { nodeLimit: 1, timeLimitMs: 60_000 });
+  assert.equal(res.feasible, false);
+  if (!res.feasible) {
+    assert.equal(res.proven, false, 'budget cutoff must not be a proven infeasibility');
+    assert.equal(res.conflict.searchLimitReached, true);
+    assert.ok(res.conflict.resourceLimits);
+    assert.doesNotMatch(JSON.stringify(res.conflict), /infeasible assignment/);
+  }
+
+  // The same request solved normally is feasible.
+  assert.equal(allocate(req).feasible, true);
+});
+
+test('HTTP layer maps a budget cutoff to 503 undetermined (not 422 infeasible)', async () => {
+  const res = await handleRequest(
+    'POST',
+    '/api/pools/allocate',
+    Buffer.from(JSON.stringify(denseBoundaryRequest())),
+    { nodeLimit: 1, timeLimitMs: 60_000 },
+  );
+  assert.equal(res.status, 503);
+  const body = res.body as { status: string; conflict: { searchLimitReached?: boolean } };
+  assert.equal(body.status, 'undetermined');
+  assert.equal(body.conflict.searchLimitReached, true);
+});
+
+test('a genuinely infeasible request proven by the search stays 422 proven', async () => {
+  // Total load 26 split into two pools each forced to exactly 13, with loads
+  // [7,7,7,1,1,1,1,1]. No subset sums to 13 (7 needs six 1s but only five
+  // exist; 7+7 overshoots), so the search proves infeasibility. Prechecks
+  // (controls, total-load bounds, colorability) all pass.
+  const req: AllocateRequest = {
+    amplicons: makeAmps([
+      ['A0', 7, true], ['A1', 7], ['A2', 7], ['A3', 1, true],
+      ['A4', 1], ['A5', 1], ['A6', 1], ['A7', 1],
+    ]),
+    poolCount: 2,
+    loadRange: { min: 13, max: 13 },
+    risks: [],
+    forbiddenThreshold: 5,
+  };
+  const res = allocate(req);
+  assert.equal(res.feasible, false);
+  if (!res.feasible) assert.equal(res.proven, true);
+
+  const http = await handleRequest(
+    'POST', '/api/pools/allocate', Buffer.from(JSON.stringify(req)),
+  );
+  assert.equal(http.status, 422);
+  assert.equal((http.body as { status: string }).status, 'infeasible');
 });

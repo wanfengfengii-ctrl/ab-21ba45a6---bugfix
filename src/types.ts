@@ -71,7 +71,9 @@ export interface ConflictSummary {
   totalLoadAboveMaximum?: { totalLoad: number; capacity: number };
   zeroThresholdForbidsAll?: { amplicons: number; pools: number };
   unsatisfiableForbiddenPairs?: { a: string; b: string; risk: number }[];
+  /** True when the exact search stopped on its node/time budget. */
   searchLimitReached?: boolean;
+  resourceLimits?: { nodeLimit: number; timeLimitMs: number };
 }
 
 export type Json =

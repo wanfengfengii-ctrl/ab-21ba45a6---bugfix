@@ -109,6 +109,30 @@ const invalidRequest = {
   forbiddenThreshold: -3,
 };
 
+// Maximal dense panel: 18 amplicons into 4 pools, all loads 1 in [4,5], the
+// first four are controls and every non-control pair has risk 1, below the
+// forbidden threshold of 2 (so no hard-forbidden edges exist). A feasible
+// panel exists: one control per pool and non-control counts 4/4/3/3. A weak
+// exact search exhausts its node budget here and must NOT report infeasible.
+const denseBoundaryRequest = {
+  amplicons: Array.from({ length: 18 }, (_, i) => ({
+    id: `A${i}`,
+    load: 1,
+    control: i < 4,
+  })),
+  poolCount: 4,
+  loadRange: { min: 4, max: 5 },
+  risks: (() => {
+    const r: { a: string; b: string; risk: number }[] = [];
+    for (let i = 4; i < 18; i++)
+      for (let j = i + 1; j < 18; j++)
+        r.push({ a: `A${i}`, b: `A${j}`, risk: 1 });
+    return r;
+  })(),
+  forbiddenThreshold: 2,
+};
+const denseBoundarySequence = [1, 2, 3, 4, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 4, 4, 4];
+
 async function post(body: unknown): Promise<{ status: number; json: any }> {
   const res = await fetch(`${BASE_URL}/api/pools/allocate`, {
     method: 'POST',
@@ -162,9 +186,46 @@ async function apiChecks(): Promise<number> {
   check(inf.json.status === 'infeasible', 'infeasible body marked infeasible');
   check(typeof inf.json.conflict?.reason === 'string' && inf.json.conflict.reason.length > 0,
     'infeasible body explains the conflict');
+  check(inf.json.conflict?.searchLimitReached !== true,
+    'a proven-infeasible 422 never carries searchLimitReached (an unfinished verdict must not be called infeasible)');
   check(Array.isArray(inf.json.conflict?.unsatisfiableForbiddenPairs) &&
     inf.json.conflict.unsatisfiableForbiddenPairs.length === 3,
     'conflict summary lists the 3 pairwise-forbidden edges');
+
+  // ---- maximal dense boundary panel (was a false "infeasible") ----
+  const dense = await post(denseBoundaryRequest);
+  check(dense.status === 200, 'dense 18-amplicon boundary returns 200 (not 422/503)',
+    `got ${dense.status}: ${JSON.stringify(dense.json).slice(0, 200)}`);
+  if (dense.status === 200) {
+    const a = dense.json.allocation;
+    check(a.pools.length === 4, 'dense boundary lists four pools');
+    check(a.maxPoolRisk === 6, 'dense boundary maxPoolRisk = 6', `maxPoolRisk=${a.maxPoolRisk}`);
+    check(a.totalRisk === 18, 'dense boundary totalRisk = 18', `totalRisk=${a.totalRisk}`);
+    check(a.loadRangeSpread === 1, 'dense boundary loadRangeSpread = 1', `spread=${a.loadRangeSpread}`);
+    const seq = a.assignment.map((x: any) => x.pool);
+    check(JSON.stringify(seq) === JSON.stringify(denseBoundarySequence),
+      'dense boundary pool sequence is the stable optimum', `seq=${JSON.stringify(seq)}`);
+    check(a.assignment.length === 18 &&
+      a.assignment.every((x: any, i: number) => x.id === `A${i}`),
+      'dense boundary assignment covers all 18 amplicons in entry order');
+    for (const pool of a.pools) {
+      check(pool.controls.length === 1, `dense boundary pool ${pool.pool} has exactly one control`);
+      check(pool.load >= 4 && pool.load <= 5,
+        `dense boundary pool ${pool.pool} load ${pool.load} within [4,5]`);
+    }
+    // Non-control distribution 4/4/3/3.
+    const nonControls = denseBoundaryRequest.amplicons.filter(x => !x.control);
+    const counts = a.pools.map((pool: any) =>
+      nonControls.filter(x => a.assignment.find((z: any) => z.id === x.id)?.pool === pool.pool).length)
+      .sort();
+    check(JSON.stringify(counts) === JSON.stringify([3, 3, 4, 4]),
+      'dense boundary non-control counts are 3/3/4/4', `counts=${JSON.stringify(counts)}`);
+    // Stability: repeat request yields the identical allocation.
+    const denseAgain = await post(denseBoundaryRequest);
+    check(denseAgain.status === 200 &&
+      JSON.stringify(denseAgain.json.allocation.assignment) === JSON.stringify(a.assignment),
+      'dense boundary repeats with the identical (stable) assignment');
+  }
 
   // ---- invalid input ----
   const inv = await post(invalidRequest);

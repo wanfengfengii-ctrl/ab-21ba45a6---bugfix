@@ -26,10 +26,19 @@ import type {
 
 export type AllocateResult =
   | { feasible: true; data: AllocateData }
-  | { feasible: false; conflict: ConflictSummary };
+  | { feasible: false; proven: true; conflict: ConflictSummary }
+  // The exact search hit its resource budget: infeasibility was NOT proven.
+  // Callers must never treat this as a definitive "no feasible assignment".
+  | { feasible: false; proven: false; conflict: ConflictSummary };
 
 const SEARCH_NODE_LIMIT = 3_000_000;
 const SEARCH_TIME_LIMIT_MS = 8_000;
+
+/** Optional overrides for the exact-search resource budget (mainly tests). */
+export interface AllocateOptions {
+  nodeLimit?: number;
+  timeLimitMs?: number;
+}
 
 interface Objective {
   maxRisk: number;
@@ -37,7 +46,12 @@ interface Objective {
   spread: number;
 }
 
-export function allocate(req: AllocateRequest): AllocateResult {
+export function allocate(
+  req: AllocateRequest,
+  options: AllocateOptions = {},
+): AllocateResult {
+  const nodeLimit = options.nodeLimit ?? SEARCH_NODE_LIMIT;
+  const timeLimitMs = options.timeLimitMs ?? SEARCH_TIME_LIMIT_MS;
   const n = req.amplicons.length;
   const k = req.poolCount;
   const ids = req.amplicons.map(a => a.id);
@@ -115,13 +129,67 @@ export function allocate(req: AllocateRequest): AllocateResult {
     });
   }
 
+  // ---- global soft-risk graph statistics for combinatorial risk bounds ----
+  // A "soft" edge is a positive-risk pair that is NOT forbidden: it is the only
+  // kind of edge that can contribute to a pool risk sum. The exact search's
+  // weakness was that its internal risk bounds counted only risks already
+  // locked into opened pools, staying zero until very deep in the tree; on
+  // dense soft graphs this left ~25 million equally-good leaves to enumerate.
+  //
+  // We bound the risk ANY completion must carry using a complete-graph
+  // relaxation with a global missing-edge allowance. Let Ns be the number of
+  // amplicons incident to at least one soft edge, Ws the number of soft edges,
+  // and miss = C(Ns,2) - Ws pairs that are not soft (zero-risk or forbidden).
+  // If a pool finally contains t soft amplicons, then among its C(t,2) pairs
+  // at most `miss` pairs can be non-soft GLOBALLY, so it holds at least
+  // max(0, C(t,2) - miss) soft edges. Across pools with final soft counts
+  // t_0..t_{k-1} (summing to Ns), total internal soft edges are at least
+  // Ws - (Ns^2 - sum t_p^2)/2 (at most that many pairs can cross pools).
+  // Both expressions are minimized (convexly) when the t_p are as balanced as
+  // possible. At a search node the already-placed soft members of each pool are
+  // fixed, so balancing the remaining soft amplicons by water-filling gives a
+  // sound per-node bound in O(k * remaining) time. Every soft edge weighs at
+  // least minSoftRisk, scaling edge counts to risk-score bounds.
+  const softVertex = new Uint8Array(n);
+  let Ws = 0;
+  let minSoftRisk = Infinity;
+  for (let i = 0; i < n; i++)
+    for (let j = i + 1; j < n; j++) {
+      const w = risk[i * n + j]!;
+      if (w > 0 && !forb[i * n + j]) {
+        softVertex[i] = 1;
+        softVertex[j] = 1;
+        Ws++;
+        if (w < minSoftRisk) minSoftRisk = w;
+      }
+    }
+  const Ns = softVertex.reduce((s, v) => s + v, 0);
+  const softPairs = (Ns * (Ns - 1)) / 2;
+  const miss = softPairs - Ws;
+  if (Ws === 0) minSoftRisk = 0;
+
+  // Number of soft amplicons still unplaced at search depth i.
+  const softSuffix = new Int16Array(n + 1);
+  for (let i = n - 1; i >= 0; i--)
+    softSuffix[i] = softSuffix[i + 1]! + softVertex[i]!;
+
   // ---- exact branch & bound ----
   const outcome = search();
   if (outcome.timeout) {
-    return infeasible({
-      reason: 'search exceeded its time/node budget; feasibility could not be determined',
-      searchLimitReached: true,
-    });
+    // The exact search stopped on its resource budget: feasibility was NEITHER
+    // proven NOR disproven. This must never be reported as "infeasible".
+    return {
+      feasible: false,
+      proven: false,
+      conflict: {
+        reason: 'the exact search reached its node/time budget before feasibility could be proven or disproven; the request is not known to be infeasible',
+        searchLimitReached: true,
+        resourceLimits: {
+          nodeLimit,
+          timeLimitMs,
+        },
+      },
+    };
   }
   if (!outcome.assignment) {
     return infeasible({
@@ -131,7 +199,7 @@ export function allocate(req: AllocateRequest): AllocateResult {
   return { feasible: true, data: buildData(outcome.assignment) };
 
   function infeasible(conflict: ConflictSummary): AllocateResult {
-    return { feasible: false, conflict };
+    return { feasible: false, proven: true, conflict };
   }
 
   // ----------------------------------------------------------------------
@@ -147,6 +215,8 @@ export function allocate(req: AllocateRequest): AllocateResult {
     const poolLoad = new Int32Array(k);
     const poolControls = new Int16Array(k);
     const poolRisk = new Float64Array(k);
+    // Soft (positive-risk, non-forbidden) amplicons already in each pool.
+    const poolSoft = new Int16Array(k);
     let poolsOpened = 0;
 
     const totalRisk = (() => {
@@ -164,7 +234,7 @@ export function allocate(req: AllocateRequest): AllocateResult {
     let best: { obj: Objective; assn: Int8Array } | null = null;
     let nodes = 0;
     let timedOut = false;
-    const deadline = Date.now() + SEARCH_TIME_LIMIT_MS;
+    const deadline = Date.now() + timeLimitMs;
 
     const canonicalLabels = (src: Int8Array): Int8Array => {
       const map = new Int8Array(k).fill(-1);
@@ -196,12 +266,58 @@ export function allocate(req: AllocateRequest): AllocateResult {
       return 0;
     };
 
+    // Combinatorial risk lower bounds from the global soft-graph relaxation.
+    // Pool p already holds poolSoft[p] soft amplicons; balance the unplaced
+    // soft amplicons across all k pools by water filling on those baselines.
+    // The resulting counts t_p are majorized by every feasible completion, so
+    // they simultaneously minimize max t_p and sum t_p^2, which is all the two
+    // bounds below need.
+    //
+    // A pool ending with t soft amplicons contains C(t,2) soft-vertex pairs;
+    // at most `miss` pairs in the whole graph are non-soft, so at least
+    // max(0, C(t,2) - miss) of them are soft edges, each weighing at least
+    // minSoftRisk. This counts already-placed edges at their minimum possible
+    // weight, so the bound stands on its own; poolRisk[] (actual placed risk)
+    // and sumRisk are folded in with max rather than added. Load/control
+    // capacities and forbidden edges are ignored here, so the relaxed feasible
+    // set contains every real completion: the bounds are sound.
+    const riskBounds = (depth: number): { lb1: number; lb2: number } => {
+      const t = new Int16Array(k);
+      for (let p = 0; p < poolsOpened; p++) t[p] = poolSoft[p]!;
+      let remaining = softSuffix[depth]!;
+      while (remaining > 0) {
+        let q = 0;
+        for (let p = 1; p < k; p++) if (t[p]! < t[q]!) q = p;
+        t[q]!++;
+        remaining--;
+      }
+      let sumSq = 0;
+      let forcedEdgesSomePool = 0;
+      for (let p = 0; p < k; p++) {
+        const tp = t[p]!;
+        sumSq += tp * tp;
+        const forced = Math.max(0, (tp * (tp - 1)) / 2 - miss);
+        if (forced > forcedEdgesSomePool) forcedEdgesSomePool = forced;
+      }
+      let sumRiskNow = 0;
+      let maxRiskNow = 0;
+      for (let p = 0; p < poolsOpened; p++) {
+        sumRiskNow += poolRisk[p]!;
+        if (poolRisk[p]! > maxRiskNow) maxRiskNow = poolRisk[p]!;
+      }
+      const forcedEdgesTotal = Math.max(0, Ws - (Ns * Ns - sumSq) / 2);
+      return {
+        lb1: Math.max(maxRiskNow, forcedEdgesSomePool * minSoftRisk),
+        lb2: Math.max(sumRiskNow, forcedEdgesTotal * minSoftRisk),
+      };
+    };
+
     // i = index of the next amplicon to place (0..n).
     // remLoad: load of amplicons i..n-1 still to distribute.
     // remRisk: risk of every edge with at least one endpoint in {i..n-1}.
     const dfs = (i: number, remLoad: number, remRisk: number): boolean => {
       if ((++nodes & 4095) === 0) {
-        if (nodes > SEARCH_NODE_LIMIT || Date.now() > deadline) {
+        if (nodes > nodeLimit || Date.now() > deadline) {
           timedOut = true;
           return true;
         }
@@ -246,6 +362,15 @@ export function allocate(req: AllocateRequest): AllocateResult {
         sumRisk += poolRisk[p]!;
       }
 
+      // Pool-aware combinatorial lower bounds over the future amplicons.
+      let lb1Risk = curMaxRisk;
+      let lb2Risk = sumRisk;
+      if (best && Ws > 0) {
+        const rb = riskBounds(i);
+        if (rb.lb1 > lb1Risk) lb1Risk = rb.lb1;
+        if (rb.lb2 > lb2Risk) lb2Risk = rb.lb2;
+      }
+
       let curMaxLoad = -Infinity;
       for (let p = 0; p < poolsOpened; p++)
         if (poolLoad[p]! > curMaxLoad) curMaxLoad = poolLoad[p]!;
@@ -255,7 +380,7 @@ export function allocate(req: AllocateRequest): AllocateResult {
         Math.ceil(totalLoad / k));
       const lbSpread = Math.max(0, finalMaxLoadLB - Math.floor(totalLoad / k));
 
-      if (best && lexPrune(i, curMaxRisk, sumRisk, lbSpread)) return false;
+      if (best && lexPrune(i, lb1Risk, lb2Risk, lbSpread)) return false;
 
       // ---- candidate labels: every opened pool, plus at most one new pool ----
       const li = loads[i]!;
@@ -274,7 +399,7 @@ export function allocate(req: AllocateRequest): AllocateResult {
         for (let j = 0; j < i; j++) {
           if (assn[j] === p) {
             if (forb[i * n + j]) { blocked = true; break; }
-            add += risk[i * n + j]!;
+            if (risk[i * n + j]! > 0) add += risk[i * n + j]!;
           }
         }
         if (!blocked) cands.push({ p, opened: true, add });
@@ -299,11 +424,13 @@ export function allocate(req: AllocateRequest): AllocateResult {
         poolLoad[p]! += li;
         if (isControl[i]) poolControls[p]!++;
         poolRisk[p]! += c.add;
+        if (softVertex[i]) poolSoft[p]!++;
         if (!c.opened) poolsOpened++;
 
         const abort = dfs(i + 1, remLoad - li, remRisk - decidedRisk);
 
         if (!c.opened) poolsOpened--;
+        if (softVertex[i]) poolSoft[p]!--;
         poolRisk[p]! -= c.add;
         if (isControl[i]) poolControls[p]!--;
         poolLoad[p]! -= li;

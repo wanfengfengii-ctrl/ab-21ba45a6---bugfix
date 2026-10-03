@@ -4,7 +4,7 @@
  */
 import type { AllocateData, ConflictSummary, Json } from './types.js';
 import { validateRequest } from './validation.js';
-import { allocate } from './solver.js';
+import { allocate, type AllocateOptions } from './solver.js';
 
 const MAX_BODY_BYTES = 1_048_576;
 
@@ -13,7 +13,12 @@ export interface Response {
   body: Json;
 }
 
-export async function handleRequest(method: string, url: string, body: Buffer): Promise<Response> {
+export async function handleRequest(
+  method: string,
+  url: string,
+  body: Buffer,
+  options: AllocateOptions = {},
+): Promise<Response> {
   if (method === 'GET' && (url === '/health' || url === '/healthz')) {
     return { status: 200, body: { status: 'ok' } };
   }
@@ -52,7 +57,7 @@ export async function handleRequest(method: string, url: string, body: Buffer): 
     return { status: 400, body: { error: 'validation_failed', fields: parsed.errors as unknown as Json } };
   }
 
-  const result = allocate(parsed.value);
+  const result = allocate(parsed.value, options);
   if (result.feasible) {
     const data: AllocateData = result.data;
     return {
@@ -66,6 +71,21 @@ export async function handleRequest(method: string, url: string, body: Buffer): 
   }
 
   const conflict: ConflictSummary = result.conflict;
+  if (!result.proven) {
+    // Resource-budget cutoff: feasibility is UNDETERMINED. This must never be
+    // reported as a proven-infeasible 422 — callers would otherwise discard a
+    // panel that may well be usable. Surface it as 503 with a distinct status
+    // so it cannot be confused with "no feasible assignment".
+    return {
+      status: 503,
+      body: {
+        status: 'undetermined',
+        message: 'the solver exhausted its search budget before feasibility could be proven or disproven; this does NOT mean no feasible assignment exists',
+        conflict: conflict as unknown as Json,
+      },
+    };
+  }
+
   return {
     status: 422,
     body: {
