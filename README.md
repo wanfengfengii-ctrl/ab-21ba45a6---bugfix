@@ -95,7 +95,7 @@ APP_PORT=3000 npm start
 ```
 
 合法但约束不可满足返回 `422`,带可读原因与冲突摘要(如禁配边列表、对照缺口、
-总负载上下界冲突、阈值为 0 全禁配等):
+总负载上下界冲突、阈值为 0 全禁配等)。`422` 只在无解被**证明**时返回:
 
 ```json
 {
@@ -104,6 +104,21 @@ APP_PORT=3000 npm start
   "conflict": {
     "reason": "forbidden-pair graph cannot be colored with 2 pool(s): ...",
     "unsatisfiableForbiddenPairs": [{ "a": "A", "b": "B", "risk": 9 }]
+  }
+}
+```
+
+若求解器在节点/时间预算内既未找到最优解也未能证明无解,返回 `503` 且
+`status=undetermined`(`conflict.searchLimitReached=true`)。这只是资源限制导致的
+裁决未完成,**绝不**表示"无可行分池";调用方可稍后重试或简化请求:
+
+```json
+{
+  "status": "undetermined",
+  "message": "feasibility could not be determined within the search budget; the request may still be satisfiable",
+  "conflict": {
+    "reason": "search exceeded its budget (3000000 nodes / 8000ms) before a verdict was proven; the request may still be satisfiable",
+    "searchLimitReached": true
   }
 }
 ```
@@ -118,7 +133,7 @@ APP_PORT=3000 npm start
 | 1 | 单元测试(`npm test`,含对暴力枚举参照实现的逐案最优性比对) |
 | 2 | TypeScript 构建(`npm run build`) |
 | 4 | 等待应用 `/health` 健康 |
-| 8 | 线上 API 核对(含**非贪心陷阱**、不可行 422、非法输入 400、稳定性复测) |
+| 8 | 线上 API 核对(含**非贪心陷阱**、18 项稠密风险边界面板、不可行 422、非法输入 400、稳定性复测) |
 
 ```bash
 docker compose up --build --abort-on-container-exit --exit-code-from verify verify
@@ -138,6 +153,15 @@ APP_BASE_URL=http://127.0.0.1:3000 npm run verify
 verify 的核心用例中,8 个负载均为 5 的扩增子分入 2 池、每池负载上限 20。
 若按"逐项放入当前最空池"会得到 `1,2,1,2,...`,使风险 100 的 `A0–A2` 同池;
 精确求解器则把它们拆开,得到 `maxPoolRisk = 0` 的最优分池。
+
+### 18 项稠密风险边界面板
+
+verify 还会提交最大规模请求:18 个负载均为 1 的扩增子分入 4 池(每池负载
+`[4,5]`,前 4 个为对照),任意两个非对照之间风险为 1、禁配阈值 2(无硬禁配)。
+最优解把 14 个非对照按 4/4/3/3 分到四个对照之后,返回
+`maxPoolRisk=6`、`totalRisk=18`、`loadRangeSpread=1`,池号序列
+`[1,2,3,4,1,1,1,1,2,2,2,2,3,3,3,4,4,4]`。该用例同时保证:搜索资源限制
+永远不会被误报为"无可行分池"。
 
 ## 目录
 

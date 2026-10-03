@@ -9,7 +9,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { allocate } from '../src/solver.js';
 import { validateRequest } from '../src/validation.js';
-import { handleRequest } from '../src/app.js';
+import { handleRequest, mapAllocateResult } from '../src/app.js';
 import type { AllocateRequest, AllocateData } from '../src/types.js';
 
 const makeAmps = (
@@ -179,6 +179,80 @@ test('solver matches brute-force optimum on random 8-amplicon instances', () => 
 });
 
 // ------------------------------------------------------- non-greedy trap case
+
+/**
+ * The 18-amplicon dense-risk boundary panel: 4 controls + 14 non-controls,
+ * all loads 1, 4 pools with load in [4,5], risk 1 on every non-control pair
+ * (below the forbidden threshold, so nothing is hard-forbidden).
+ */
+function boundaryPanelRequest(): AllocateRequest {
+  const amplicons = Array.from({ length: 18 }, (_, i) => ({
+    id: `A${i}`,
+    load: 1,
+    control: i < 4,
+  }));
+  const risks = [];
+  for (let i = 4; i < 18; i++)
+    for (let j = i + 1; j < 18; j++)
+      risks.push({ a: `A${i}`, b: `A${j}`, risk: 1 });
+  return {
+    amplicons,
+    poolCount: 4,
+    loadRange: { min: 4, max: 5 },
+    risks,
+    forbiddenThreshold: 2,
+  };
+}
+
+test('18-amplicon dense-risk boundary panel is solved to its proven optimum', () => {
+  // Feasible packing: one control per pool, non-controls split 4/4/3/3.
+  // The search must prove this optimum, not give up at its budget.
+  const req = boundaryPanelRequest();
+  const data = expectFeasible(req);
+  assertHardConstraints(req, data);
+  assert.equal(data.maxPoolRisk, 6);
+  assert.equal(data.totalRisk, 18);
+  assert.equal(data.loadRangeSpread, 1);
+  assert.deepEqual(
+    data.assignment.map(a => a.pool),
+    [1, 2, 3, 4, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 4, 4, 4],
+  );
+  // Determinism: a repeated call returns the identical allocation.
+  const again = expectFeasible(req);
+  assert.deepEqual(again.assignment, data.assignment);
+});
+
+test('search budget exhaustion is undetermined, never a false infeasible', () => {
+  const res = allocate(boundaryPanelRequest(), { nodeLimit: 5, timeLimitMs: 60_000 });
+  if (res.feasible) assert.fail('expected an undetermined verdict, got feasible');
+  assert.equal(res.undetermined, true);
+  assert.equal(res.conflict.searchLimitReached, true);
+});
+
+test('an exhausted time budget is likewise undetermined', () => {
+  const res = allocate(boundaryPanelRequest(), { nodeLimit: 1_000_000_000, timeLimitMs: 0 });
+  if (res.feasible) assert.fail('expected an undetermined verdict, got feasible');
+  assert.equal(res.undetermined, true);
+});
+
+test('undetermined verdicts map to 503, proven infeasible ones to 422', () => {
+  const req = boundaryPanelRequest();
+  const und = mapAllocateResult(
+    { feasible: false, undetermined: true, conflict: { reason: 'x', searchLimitReached: true } },
+    req,
+  );
+  assert.equal(und.status, 503);
+  const undBody = und.body as { status: string };
+  assert.equal(undBody.status, 'undetermined');
+  assert.notEqual(undBody.status, 'infeasible');
+
+  const inf = mapAllocateResult(
+    { feasible: false, conflict: { reason: 'proven' } },
+    req,
+  );
+  assert.equal(inf.status, 422);
+  assert.equal((inf.body as { status: string }).status, 'infeasible');
+});
 
 test('non-greedy trap: emptiest-pool greedy would create a high-risk dimer', () => {
   // 8 amplicons, load 5 each -> each of the 2 pools must total exactly 20.

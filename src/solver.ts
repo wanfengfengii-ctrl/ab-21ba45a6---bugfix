@@ -13,9 +13,16 @@
  *   3. spread between the busiest and the emptiest pool
  *   4. the pool-number sequence, flattened in amplicon entry order
  *
- * The search is branch & bound with MRV variable ordering, pool-symmetry
- * breaking and incremental bounds. It is exact: the returned assignment is a
- * proven optimum, not a greedy approximation.
+ * The search is branch & bound over entry-order restricted-growth sequences
+ * (pool-symmetry breaking). Lower bounds derived from the not-yet-placed
+ * suffix — per-pool intake capacities, the cheapest risk each unplaced
+ * amplicon must pay, and the mutual risk any newcomer set must realize —
+ * make all four lexicographic tiers prunable, including the pool-number
+ * sequence. The search is exact: the returned assignment is a proven
+ * optimum, not a greedy approximation.
+ *
+ * If the node/time budget is ever exhausted, the verdict is "undetermined"
+ * and is never reported as infeasible.
  */
 import type {
   AllocateRequest,
@@ -26,10 +33,18 @@ import type {
 
 export type AllocateResult =
   | { feasible: true; data: AllocateData }
-  | { feasible: false; conflict: ConflictSummary };
+  | { feasible: false; undetermined?: false; conflict: ConflictSummary }
+  | { feasible: false; undetermined: true; conflict: ConflictSummary };
 
-const SEARCH_NODE_LIMIT = 3_000_000;
-const SEARCH_TIME_LIMIT_MS = 8_000;
+export interface AllocateOptions {
+  /** Maximum number of search nodes before the verdict becomes undetermined. */
+  nodeLimit?: number;
+  /** Wall-clock budget for the search, in milliseconds. */
+  timeLimitMs?: number;
+}
+
+const DEFAULT_NODE_LIMIT = 3_000_000;
+const DEFAULT_TIME_LIMIT_MS = 8_000;
 
 interface Objective {
   maxRisk: number;
@@ -37,7 +52,9 @@ interface Objective {
   spread: number;
 }
 
-export function allocate(req: AllocateRequest): AllocateResult {
+export function allocate(req: AllocateRequest, options?: AllocateOptions): AllocateResult {
+  const nodeLimit = options?.nodeLimit ?? DEFAULT_NODE_LIMIT;
+  const timeLimitMs = options?.timeLimitMs ?? DEFAULT_TIME_LIMIT_MS;
   const n = req.amplicons.length;
   const k = req.poolCount;
   const ids = req.amplicons.map(a => a.id);
@@ -117,11 +134,17 @@ export function allocate(req: AllocateRequest): AllocateResult {
 
   // ---- exact branch & bound ----
   const outcome = search();
-  if (outcome.timeout) {
-    return infeasible({
-      reason: 'search exceeded its time/node budget; feasibility could not be determined',
-      searchLimitReached: true,
-    });
+  if (outcome.limitReached) {
+    // The budget ran out before the search space was exhausted: feasibility
+    // is unknown. This must never surface as "no feasible assignment".
+    return {
+      feasible: false,
+      undetermined: true,
+      conflict: {
+        reason: `search exceeded its budget (${nodeLimit} nodes / ${timeLimitMs}ms) before a verdict was proven; the request may still be satisfiable`,
+        searchLimitReached: true,
+      },
+    };
   }
   if (!outcome.assignment) {
     return infeasible({
@@ -136,7 +159,7 @@ export function allocate(req: AllocateRequest): AllocateResult {
 
   // ----------------------------------------------------------------------
 
-  function search(): { assignment: Int8Array | null; timeout: boolean } {
+  function search(): { assignment: Int8Array | null; limitReached: boolean } {
     // Fixed entry-order assignment with restricted growth labels:
     // amplicon i is assigned before i+1, and a new pool may only receive the
     // next index (0, 1, ..., k-1). Every partition is therefore represented
@@ -149,12 +172,20 @@ export function allocate(req: AllocateRequest): AllocateResult {
     const poolRisk = new Float64Array(k);
     let poolsOpened = 0;
 
-    const totalRisk = (() => {
-      let t = 0;
-      for (let i = 0; i < n; i++)
-        for (let j = i + 1; j < n; j++) t += risk[i * n + j]!;
-      return t;
-    })();
+    // riskToPool[j*k + q]: risk that the still-unplaced amplicon j would add
+    // if it joined pool q right now (its risk sum against the amplicons
+    // currently in q). Maintained incrementally as the search (un)places.
+    const riskToPool = new Float64Array(n * k);
+
+    // Scratch buffers for the per-node lower-bound computation.
+    const sortBuf = new Float64Array(n);
+    const prefixP = new Float64Array(k * (n + 1)); // prefixP[q*(n+1)+t]
+    const minMutual = new Float64Array(n);         // per newcomer-count bound
+    const gPool = new Float64Array(k * (n + 1));   // gPool[q*(n+1)+t]
+    const candV = new Float64Array(k * (n + 1));
+    const deltaBuf = new Float64Array(k * n);
+    const loArr = new Int32Array(k);
+    const capArr = new Int32Array(k);
 
     // Controls among amplicons i..n-1 (suffix counts).
     const controlsSuffix = new Int16Array(n + 1);
@@ -163,8 +194,8 @@ export function allocate(req: AllocateRequest): AllocateResult {
 
     let best: { obj: Objective; assn: Int8Array } | null = null;
     let nodes = 0;
-    let timedOut = false;
-    const deadline = Date.now() + SEARCH_TIME_LIMIT_MS;
+    let limitReached = false;
+    const deadline = Date.now() + timeLimitMs;
 
     const canonicalLabels = (src: Int8Array): Int8Array => {
       const map = new Int8Array(k).fill(-1);
@@ -196,15 +227,25 @@ export function allocate(req: AllocateRequest): AllocateResult {
       return 0;
     };
 
+    // Insertion sort on sortBuf[0..len): tiny lengths, no allocations.
+    const sortAsc = (len: number) => {
+      for (let a = 1; a < len; a++) {
+        const v = sortBuf[a]!;
+        let b = a - 1;
+        while (b >= 0 && sortBuf[b]! > v) {
+          sortBuf[b + 1] = sortBuf[b]!;
+          b--;
+        }
+        sortBuf[b + 1] = v;
+      }
+    };
+
     // i = index of the next amplicon to place (0..n).
     // remLoad: load of amplicons i..n-1 still to distribute.
-    // remRisk: risk of every edge with at least one endpoint in {i..n-1}.
-    const dfs = (i: number, remLoad: number, remRisk: number): boolean => {
-      if ((++nodes & 4095) === 0) {
-        if (nodes > SEARCH_NODE_LIMIT || Date.now() > deadline) {
-          timedOut = true;
-          return true;
-        }
+    const dfs = (i: number, remLoad: number): boolean => {
+      if (++nodes > nodeLimit || ((nodes & 1023) === 0 && Date.now() > deadline)) {
+        limitReached = true;
+        return true;
       }
 
       if (i === n) {
@@ -216,11 +257,12 @@ export function allocate(req: AllocateRequest): AllocateResult {
         return false;
       }
 
+      const r = n - i; // amplicons still to place
+
       // ---- global feasibility checks for the current prefix ----
       // Enough amplicons must remain to open every still-unopened pool.
-      const ampliconsLeft = n - i;
       const unopened = k - poolsOpened;
-      if (ampliconsLeft < unopened) return false;
+      if (r < unopened) return false;
 
       // Future controls must cover control-less opened pools and all unopened.
       let controlLessOpened = 0;
@@ -238,14 +280,32 @@ export function allocate(req: AllocateRequest): AllocateResult {
       spare += unopened * maxLoad;
       if (remLoad < deficit || remLoad > spare) return false;
 
-      // ---- objective bounds ----
-      let curMaxRisk = 0;
-      let sumRisk = 0;
-      for (let p = 0; p < poolsOpened; p++) {
-        if (poolRisk[p]! > curMaxRisk) curMaxRisk = poolRisk[p]!;
-        sumRisk += poolRisk[p]!;
+      // ---- count-level feasibility over the remaining amplicons ----
+      // loArr[q]: amplicons pool q still needs to reach loadRange.min.
+      // capArr[q]: amplicons pool q can still take under loadRange.max.
+      let minRem = Infinity;
+      let maxRem = 0;
+      for (let j = i; j < n; j++) {
+        const lj = loads[j]!;
+        if (lj < minRem) minRem = lj;
+        if (lj > maxRem) maxRem = lj;
       }
+      let loSum = 0;
+      let capSum = 0;
+      for (let q = 0; q < k; q++) {
+        const deficitQ = minLoad - poolLoad[q]!;
+        const lo = deficitQ > 0 ? Math.ceil(deficitQ / maxRem) : 0;
+        let cap = Math.floor((maxLoad - poolLoad[q]!) / minRem);
+        if (cap > r) cap = r;
+        if (lo > cap) return false;
+        loArr[q] = lo;
+        capArr[q] = cap;
+        loSum += lo;
+        capSum += cap;
+      }
+      if (loSum > r || capSum < r) return false;
 
+      // ---- objective bounds ----
       let curMaxLoad = -Infinity;
       for (let p = 0; p < poolsOpened; p++)
         if (poolLoad[p]! > curMaxLoad) curMaxLoad = poolLoad[p]!;
@@ -255,29 +315,102 @@ export function allocate(req: AllocateRequest): AllocateResult {
         Math.ceil(totalLoad / k));
       const lbSpread = Math.max(0, finalMaxLoadLB - Math.floor(totalLoad / k));
 
-      if (best && lexPrune(i, curMaxRisk, sumRisk, lbSpread)) return false;
+      if (best) {
+        // Lower bounds for tiers 1-2 derived from the unplaced suffix.
+        //
+        // If pool q receives exactly t more amplicons, its final risk sum is
+        // at least
+        //   g_q(t) = curRisk[q] + P_q(t) + M(t)
+        // where P_q(t) is the sum of the t smallest riskToPool values of
+        // unplaced amplicons (each newcomer pays at least its current
+        // risk-to-pool, which only grows) and M(t) lower-bounds the mutual
+        // risk any t newcomers must realize among themselves:
+        //   M(t) = (t/2) * min_j (sum of the t-1 smallest risks from j to
+        //          other unplaced amplicons).
+        // Tier 2: min over intake vectors of the sum of g_q(t_q), relaxed to
+        // base sums plus the cheapest per-pool increments.
+        // Tier 1: the smallest V such that some intake vector keeps every
+        // g_q(t_q) <= V (a min-max relaxation).
+
+        // prefixP: sorted riskToPool values per pool, prefix-summed.
+        for (let q = 0; q < k; q++) {
+          let m = 0;
+          for (let j = i; j < n; j++) sortBuf[m++] = riskToPool[j * k + q]!;
+          sortAsc(m);
+          const pp = q * (n + 1);
+          prefixP[pp] = 0;
+          for (let t = 1; t <= m; t++) prefixP[pp + t] = prefixP[pp + t - 1]! + sortBuf[t - 1]!;
+        }
+
+        // minMutual[u]: min over unplaced j of the sum of the u smallest
+        // risks from j to other unplaced amplicons.
+        minMutual[0] = 0;
+        for (let u = 1; u < r; u++) minMutual[u] = Infinity;
+        for (let j = i; j < n; j++) {
+          let m = 0;
+          for (let j2 = i; j2 < n; j2++) {
+            if (j2 !== j) sortBuf[m++] = risk[j * n + j2]!;
+          }
+          sortAsc(m); // m = r-1
+          let acc = 0;
+          for (let u = 1; u <= m; u++) {
+            acc += sortBuf[u - 1]!;
+            if (acc < minMutual[u]!) minMutual[u] = acc;
+          }
+        }
+
+        // g_q(t) tables, base sums and per-pool increments.
+        let gCount = 0;
+        let deltaCount = 0;
+        let baseSum = 0;
+        for (let q = 0; q < k; q++) {
+          const pp = q * (n + 1);
+          const cur = poolRisk[q]!;
+          const lo = loArr[q]!;
+          const cap = capArr[q]!;
+          let prevG = 0;
+          for (let t = lo; t <= cap; t++) {
+            const g = cur + prefixP[pp + t]! + (t > 0 ? (t * minMutual[t - 1]!) / 2 : 0);
+            gPool[pp + t] = g;
+            candV[gCount++] = g;
+            if (t === lo) baseSum += g;
+            else deltaBuf[deltaCount++] = g - prevG;
+            prevG = g;
+          }
+        }
+
+        // Tier-2 bound: base sums plus the (r - loSum) cheapest increments.
+        const need = r - loSum;
+        sortAscBuf(deltaBuf, deltaCount);
+        let lbTotal = baseSum;
+        for (let d = 0; d < need; d++) lbTotal += deltaBuf[d]!;
+
+        // Tier-1 bound: smallest candidate V admitting a count-feasible
+        // intake vector that keeps every pool at or below V.
+        sortAscBuf(candV, gCount);
+        let loI = 0;
+        let hiI = gCount - 1;
+        while (loI < hiI) {
+          const mid = (loI + hiI) >> 1;
+          if (maxIntakeFeasible(candV[mid]!)) hiI = mid;
+          else loI = mid + 1;
+        }
+        const lbMax = candV[loI]!;
+
+        if (lexPrune(i, lbMax, lbTotal, lbSpread)) return false;
+      }
 
       // ---- candidate labels: every opened pool, plus at most one new pool ----
       const li = loads[i]!;
-      const decidedRisk = (() => {
-        let t = 0;
-        for (let j = 0; j < i; j++) t += risk[i * n + j]!;
-        return t;
-      })();
-
       interface Cand { p: number; opened: boolean; add: number }
       const cands: Cand[] = [];
       for (let p = 0; p < poolsOpened; p++) {
         if (poolLoad[p]! + li > maxLoad) continue;
         let blocked = false;
-        let add = 0;
         for (let j = 0; j < i; j++) {
-          if (assn[j] === p) {
-            if (forb[i * n + j]) { blocked = true; break; }
-            add += risk[i * n + j]!;
-          }
+          if (assn[j] === p && forb[i * n + j]) { blocked = true; break; }
         }
-        if (!blocked) cands.push({ p, opened: true, add });
+        if (!blocked) cands.push({ p, opened: true, add: riskToPool[i * k + p]! });
       }
       if (poolsOpened < k) {
         // Opening the next label; amplicons after i must open the rest.
@@ -293,26 +426,47 @@ export function allocate(req: AllocateRequest): AllocateResult {
 
       for (const c of cands) {
         const p = c.p;
-        const wasControlLess = c.opened && poolControls[p] === 0;
 
         assn[i] = p;
         poolLoad[p]! += li;
         if (isControl[i]) poolControls[p]!++;
         poolRisk[p]! += c.add;
         if (!c.opened) poolsOpened++;
+        for (let j = i + 1; j < n; j++) riskToPool[j * k + p]! += risk[i * n + j]!;
 
-        const abort = dfs(i + 1, remLoad - li, remRisk - decidedRisk);
+        const abort = dfs(i + 1, remLoad - li);
 
+        for (let j = i + 1; j < n; j++) riskToPool[j * k + p]! -= risk[i * n + j]!;
         if (!c.opened) poolsOpened--;
         poolRisk[p]! -= c.add;
         if (isControl[i]) poolControls[p]!--;
         poolLoad[p]! -= li;
         assn[i] = -1;
-        void wasControlLess;
 
         if (abort) return true;
       }
       return false;
+
+      // Largest per-pool intake such that every pool's g stays <= v, summed;
+      // feasible iff that total can absorb all remaining amplicons.
+      function maxIntakeFeasible(v: number): boolean {
+        let totalMaxT = 0;
+        for (let q = 0; q < k; q++) {
+          const pp = q * (n + 1);
+          const lo = loArr[q]!;
+          const cap = capArr[q]!;
+          if (gPool[pp + lo]! > v) return false;
+          let a = lo;
+          let b = cap;
+          while (a < b) {
+            const mid = (a + b + 1) >> 1;
+            if (gPool[pp + mid]! <= v) a = mid;
+            else b = mid - 1;
+          }
+          totalMaxT += a;
+        }
+        return totalMaxT >= r;
+      }
 
       // Sound lexicographic pruning using the fixed prefix [0, i).
       function lexPrune(
@@ -341,6 +495,19 @@ export function allocate(req: AllocateRequest): AllocateResult {
       }
     };
 
+    // Insertion sort on an arbitrary buffer (deltaBuf / candV).
+    function sortAscBuf(buf: Float64Array, len: number) {
+      for (let a = 1; a < len; a++) {
+        const v = buf[a]!;
+        let b = a - 1;
+        while (b >= 0 && buf[b]! > v) {
+          buf[b + 1] = buf[b]!;
+          b--;
+        }
+        buf[b + 1] = v;
+      }
+    }
+
     function currentObjectiveAtLeaf(): Objective | null {
       let hi = 0;
       let sum = 0;
@@ -357,8 +524,8 @@ export function allocate(req: AllocateRequest): AllocateResult {
       return { maxRisk: hi, totalRisk: sum, spread: maxL - minL };
     }
 
-    dfs(0, totalLoad, totalRisk);
-    return { assignment: timedOut || !best ? null : best.assn, timeout: timedOut };
+    dfs(0, totalLoad);
+    return { assignment: limitReached || !best ? null : best.assn, limitReached };
   }
 
   function scoreAssignment(candidate: Int8Array): Objective | null {
@@ -397,8 +564,10 @@ export function allocate(req: AllocateRequest): AllocateResult {
 
   /**
    * Deterministic greedy seed: most-forbidden amplicon first (then heaviest),
-   * best-fit by added risk then distance from the average pool load. It can
-   * fail; the exact search then starts without an incumbent.
+   * best-fit by added risk then distance from the average pool load. Control
+   * amplicons are steered to pools that still lack one, so the seed covers
+   * every pool with a control whenever that is possible. It can still fail;
+   * the exact search then starts without an incumbent.
    */
   function greedySeed(): Int8Array | null {
     const cand = new Int8Array(n).fill(-1);
@@ -413,11 +582,19 @@ export function allocate(req: AllocateRequest): AllocateResult {
     });
     const used = new Uint8Array(n);
     for (const i of orderA) {
+      // A control goes to a control-less pool while any remains.
+      let steerToControlLess = false;
+      if (isControl[i]) {
+        for (let p = 0; p < k; p++) {
+          if (c[p] === 0) { steerToControlLess = true; break; }
+        }
+      }
       let pick = -1;
       let pickAdd = Infinity;
       let pickDist = Infinity;
       for (let p = 0; p < k; p++) {
         if (l[p]! + loads[i]! > maxLoad) continue;
+        if (steerToControlLess && c[p]! > 0) continue;
         let blocked = false;
         let add = 0;
         for (let j = 0; j < n; j++) {

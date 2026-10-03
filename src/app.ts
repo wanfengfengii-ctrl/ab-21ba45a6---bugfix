@@ -2,9 +2,10 @@
  * HTTP application: routing, JSON parsing and response mapping.
  * Kept dependency-free so it runs on a bare Node.js image.
  */
-import type { AllocateData, ConflictSummary, Json } from './types.js';
+import type { AllocateData, AllocateRequest, ConflictSummary, Json } from './types.js';
 import { validateRequest } from './validation.js';
 import { allocate } from './solver.js';
+import type { AllocateResult } from './solver.js';
 
 const MAX_BODY_BYTES = 1_048_576;
 
@@ -52,20 +53,38 @@ export async function handleRequest(method: string, url: string, body: Buffer): 
     return { status: 400, body: { error: 'validation_failed', fields: parsed.errors as unknown as Json } };
   }
 
-  const result = allocate(parsed.value);
+  return mapAllocateResult(allocate(parsed.value), parsed.value);
+}
+
+/**
+ * Map a solver verdict to an HTTP response. A budget-exhausted search is
+ * "undetermined" (503), never a false "infeasible" verdict — only a proven
+ * exhaustion of the search space may be reported as 422/infeasible.
+ */
+export function mapAllocateResult(result: AllocateResult, req: AllocateRequest): Response {
   if (result.feasible) {
     const data: AllocateData = result.data;
     return {
       status: 200,
       body: {
         status: 'feasible',
-        message: `allocated ${parsed.value.amplicons.length} amplicons across ${data.poolCount} pools`,
+        message: `allocated ${req.amplicons.length} amplicons across ${data.poolCount} pools`,
         allocation: data as unknown as Json,
       },
     };
   }
 
   const conflict: ConflictSummary = result.conflict;
+  if (result.undetermined) {
+    return {
+      status: 503,
+      body: {
+        status: 'undetermined',
+        message: 'feasibility could not be determined within the search budget; the request may still be satisfiable',
+        conflict: conflict as unknown as Json,
+      },
+    };
+  }
   return {
     status: 422,
     body: {

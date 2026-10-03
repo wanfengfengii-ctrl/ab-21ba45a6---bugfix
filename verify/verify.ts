@@ -5,7 +5,9 @@
  *   1. unit tests   (bit 0 -> exit code 1 on failure)
  *   2. TypeScript build (bit 1 -> exit code 2 on failure)
  *   3. wait for application health (bit 2 -> exit code 4)
- *   4. live API checks, including a non-greedy trap (bit 3 -> exit code 8)
+ *   4. live API checks, including a non-greedy trap, the 18-amplicon
+ *      dense-risk boundary panel, a proven-infeasible request and an
+ *      invalid request (bit 3 -> exit code 8)
  *
  * Exit code is the bitmask of failed phases (0 == everything passed), so the
  * container reports the complete verification summary in a single code.
@@ -101,6 +103,32 @@ const infeasibleRequest = {
   forbiddenThreshold: 9,
 };
 
+// 18-amplicon dense-risk boundary panel: the largest advertised request.
+// 4 controls + 14 non-controls, all loads 1, 4 pools with load in [4,5].
+// Every non-control pair carries risk 1 — below the forbidden threshold 2,
+// so no pair is hard-forbidden and a feasible packing exists (non-controls
+// split 4/4/3/3 behind the four controls). A search that mistook its own
+// resource limit for infeasibility would wrongly reject this panel.
+const boundaryRequest = (() => {
+  const amplicons = Array.from({ length: 18 }, (_, i) => ({
+    id: `B${i}`,
+    load: 1,
+    control: i < 4,
+  }));
+  const risks: { a: string; b: string; risk: number }[] = [];
+  for (let i = 4; i < 18; i++)
+    for (let j = i + 1; j < 18; j++)
+      risks.push({ a: `B${i}`, b: `B${j}`, risk: 1 });
+  return {
+    amplicons,
+    poolCount: 4,
+    loadRange: { min: 4, max: 5 },
+    risks,
+    forbiddenThreshold: 2,
+  };
+})();
+const boundarySequence = [1, 2, 3, 4, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 4, 4, 4];
+
 const invalidRequest = {
   amplicons: [{ id: 'A0', load: -1, control: true }],
   poolCount: 9,
@@ -156,6 +184,33 @@ async function apiChecks(): Promise<number> {
       'repeated request yields the identical (stable) assignment');
   }
 
+  // ---- 18-amplicon dense-risk boundary panel ----
+  const bnd = await post(boundaryRequest);
+  check(bnd.status === 200, 'boundary panel returns 200', `got ${bnd.status}: ${JSON.stringify(bnd.json)}`);
+  check(bnd.json.status === 'feasible', 'boundary panel is feasible (not a search-limit false negative)');
+  check(!JSON.stringify(bnd.json).includes('searchLimitReached'),
+    'boundary response carries no search-limit marker');
+  if (bnd.status === 200) {
+    const a = bnd.json.allocation;
+    check(a.maxPoolRisk === 6, 'boundary maxPoolRisk is 6', `maxPoolRisk=${a.maxPoolRisk}`);
+    check(a.totalRisk === 18, 'boundary totalRisk is 18', `totalRisk=${a.totalRisk}`);
+    check(a.loadRangeSpread === 1, 'boundary loadRangeSpread is 1', `loadRangeSpread=${a.loadRangeSpread}`);
+    check(JSON.stringify(a.assignment.map((x: any) => x.pool)) === JSON.stringify(boundarySequence),
+      'boundary pool sequence is the stable proven optimum',
+      `got ${JSON.stringify(a.assignment.map((x: any) => x.pool))}`);
+    check(a.assignment.every((x: any, i: number) => x.id === boundaryRequest.amplicons[i]!.id),
+      'boundary assignment follows amplicon entry order');
+    for (const pool of a.pools) {
+      check(pool.controls.length >= 1, `boundary pool ${pool.pool} has a positive control`);
+      check(pool.load >= 4 && pool.load <= 5, `boundary pool ${pool.pool} load ${pool.load} within [4,5]`);
+    }
+    // Stability: repeat request yields an identical pool sequence.
+    const again = await post(boundaryRequest);
+    check(again.status === 200 &&
+      JSON.stringify(again.json.allocation?.assignment) === JSON.stringify(a.assignment),
+      'repeated boundary request yields the identical (stable) assignment');
+  }
+
   // ---- infeasible ----
   const inf = await post(infeasibleRequest);
   check(inf.status === 422, 'infeasible request returns 422', `got ${inf.status}`);
@@ -165,6 +220,8 @@ async function apiChecks(): Promise<number> {
   check(Array.isArray(inf.json.conflict?.unsatisfiableForbiddenPairs) &&
     inf.json.conflict.unsatisfiableForbiddenPairs.length === 3,
     'conflict summary lists the 3 pairwise-forbidden edges');
+  check(inf.json.conflict?.searchLimitReached !== true,
+    'proven-infeasible verdict is not a search-limit artifact');
 
   // ---- invalid input ----
   const inv = await post(invalidRequest);
